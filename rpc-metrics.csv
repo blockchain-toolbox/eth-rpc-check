@@ -1,0 +1,7 @@
+chain,method,call_count,success_count,min_latency_ms,max_latency_ms,avg_latency_ms,median_latency_ms,p95_latency_ms,success_rate
+BSC,eth_gasPrice,3,3,112.79,117.62,115.50,116.10,117.62,1.00
+BSC,eth_blockNumber,3,3,113.38,118.23,115.74,115.62,118.23,1.00
+BSC,web3_clientVersion,3,3,115.57,523.47,252.54,118.59,523.47,1.00
+ETH,eth_gasPrice,3,3,256.18,276.31,263.21,257.12,276.31,1.00
+ETH,eth_blockNumber,3,3,257.98,613.72,381.91,274.03,613.72,1.00
+ETH,web3_clientVersion,3,3,253.06,770.84,429.14,263.54,770.84,1.00
