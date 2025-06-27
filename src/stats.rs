@@ -147,7 +147,7 @@ pub fn write_to_csv(stats: &[MethodStats], output_path: &Path) -> Result<()> {
         "avg_latency_ms",
         "median_latency_ms",
         "p95_latency_ms",
-        "success_rate",
+        "success_rate_percent",
     ])?;
     
     // 写入每个方法的统计数据
@@ -180,7 +180,6 @@ pub fn print_stats(stats: &[MethodStats]) {
     // 添加表头
     table.add_row(Row::new(vec![
         Cell::new("链"),
-        Cell::new("端点URL"),
         Cell::new("方法"),
         Cell::new("调用次数"),
         Cell::new("成功次数"),
@@ -204,8 +203,8 @@ pub fn print_stats(stats: &[MethodStats]) {
         // 添加链的标题行
         table.add_row(Row::new(vec![
             Cell::new(&format!("== {} 总结 ==", chain)).style_spec("FgBrightCyan"),
-            Cell::new("").style_spec("FgBrightCyan"),
             Cell::new(&format!("方法总数: {}", chain_stats.len())).style_spec("FgBrightCyan"),
+            Cell::new("").style_spec("FgBrightCyan"),
             Cell::new("").style_spec("FgBrightCyan"),
             Cell::new(&format!("平均成功率: {:.2}%", chain_avg_success_rate * 100.0)).style_spec("FgBrightCyan"),
             Cell::new("").style_spec("FgBrightCyan"),

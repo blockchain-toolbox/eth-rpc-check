@@ -7,8 +7,45 @@ use futures::{pin_mut, SinkExt, StreamExt};
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message, WebSocketStream, MaybeTlsStream};
 use url::Url;
+use tokio::net::TcpStream;
+use std::collections::HashMap;
+use log::{debug, info, warn, error};
+
+/// 配置常量
+pub struct Config {
+    pub http_timeout_secs: u64,
+    pub ws_timeout_secs: u64,
+    pub request_delay_ms: u64,
+    pub max_concurrent_requests: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            http_timeout_secs: 10,
+            ws_timeout_secs: 15,
+            request_delay_ms: 100,
+            max_concurrent_requests: 10,
+        }
+    }
+}
+
+/// 自定义错误类型
+#[derive(Debug, thiserror::Error)]
+pub enum RpcError {
+    #[error("网络连接错误: {0}")]
+    NetworkError(String),
+    #[error("JSON-RPC错误: {0}")]
+    JsonRpcError(String),
+    #[error("WebSocket连接错误: {0}")]
+    WebSocketError(String),
+    #[error("超时错误: {0}")]
+    TimeoutError(String),
+    #[error("配置错误: {0}")]
+    ConfigError(String),
+}
 
 /// RPC 调用的结果
 #[derive(Debug, Clone)]
@@ -29,216 +66,235 @@ pub struct RpcResult {
     pub timestamp: chrono::DateTime<Utc>,
 }
 
-/// 通过HTTP发送 RPC 请求并返回结果
-async fn send_http_rpc_request(
-    client: &Client,
-    rpc_url: &str,
-    method: &str,
-    params: &[Value],
-) -> Result<(bool, f64, Option<String>, Value)> {
-    let start = Instant::now();
-    
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params
-    });
-    
-    let response = client
-        .post(rpc_url)
-        .json(&request_body)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .context("发送 HTTP RPC 请求失败")?;
-    
-    let latency = start.elapsed().as_secs_f64() * 1000.0;
-    
-    let response_body: Value = response
-        .json()
-        .await
-        .context("解析 HTTP RPC 响应失败")?;
-    
-    let success = response_body.get("error").is_none();
-    let error = if !success {
-        response_body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .map(|s| s.to_string())
-    } else {
-        None
-    };
-    
-    Ok((success, latency, error, response_body))
+/// WebSocket连接管理器
+pub struct WebSocketManager {
+    connections: HashMap<String, WebSocketStream<MaybeTlsStream<TcpStream>>>,
+    config: Config,
 }
 
-/// 通过WebSocket发送 RPC 请求并返回结果
-async fn send_ws_rpc_request(
-    rpc_url: &str,
-    method: &str,
-    params: &[Value],
-) -> Result<(bool, f64, Option<String>, Value)> {
-    let start = Instant::now();
-    
-    // 解析WebSocket URL
-    let url = Url::parse(rpc_url).context("解析WebSocket URL失败")?;
-    
-    println!("  [调试] 连接WebSocket: {}", rpc_url);
-    
-    // 连接到WebSocket
-    let (mut ws_stream, _) = match connect_async(url).await {
-        Ok(stream) => {
-            println!("  [调试] WebSocket连接成功");
-            stream
-        },
-        Err(e) => {
-            println!("  [调试] WebSocket连接失败: {}", e);
-            return Err(anyhow!("连接WebSocket失败: {}", e));
+impl WebSocketManager {
+    pub fn new(config: Config) -> Self {
+        Self {
+            connections: HashMap::new(),
+            config,
         }
-    };
-    
-    // 创建请求消息
-    let request_id = 1;
-    let request_body = json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": method,
-        "params": params
-    });
-    
-    // 发送请求
-    let request_message = Message::Text(request_body.to_string());
-    println!("  [调试] 发送WebSocket请求: {}", method);
-    if let Err(e) = ws_stream.send(request_message).await {
-        println!("  [调试] 发送WebSocket消息失败: {}", e);
-        return Err(anyhow!("发送WebSocket消息失败: {}", e));
     }
-    
-    // 设置超时
-    let timeout_duration = Duration::from_secs(15); // 增加超时时间
-    let timeout = tokio::time::sleep(timeout_duration);
-    
-    // 等待响应或超时
-    let response_future = ws_stream.next();
-    
-    // 使用pin_mut宏确保futures被正确pin
-    pin_mut!(response_future);
-    pin_mut!(timeout);
-    
-    // 等待响应或超时
-    println!("  [调试] 等待WebSocket响应...");
-    let response = match future::select(response_future, timeout).await {
-        Either::Left((Some(Ok(response)), _)) => {
-            println!("  [调试] 收到WebSocket响应");
-            response
-        },
-        Either::Left((Some(Err(e)), _)) => {
-            let err_msg = format!("WebSocket响应错误: {}", e);
-            println!("  [调试] {}", err_msg);
-            return Err(anyhow!(err_msg));
-        },
-        Either::Left((None, _)) => {
-            let err_msg = "WebSocket连接已关闭";
-            println!("  [调试] {}", err_msg);
-            return Err(anyhow!(err_msg));
-        },
-        Either::Right((_, _)) => {
-            let err_msg = "WebSocket请求超时(15秒)";
-            println!("  [调试] {}", err_msg);
-            return Err(anyhow!(err_msg));
-        },
-    };
-    
-    // 计算延迟
-    let latency = start.elapsed().as_secs_f64() * 1000.0;
-    
-    // 处理响应
-    let response_text = match response {
-        Message::Text(text) => text,
-        _ => {
-            let err_msg = "收到非文本WebSocket响应";
-            println!("  [调试] {}", err_msg);
-            return Err(anyhow!(err_msg));
-        }
-    };
-    
-    // 解析响应
-    let response_body: Value = match serde_json::from_str(&response_text) {
-        Ok(body) => body,
-        Err(e) => {
-            let err_msg = format!("解析WebSocket响应JSON失败: {}", e);
-            println!("  [调试] {}", err_msg);
-            return Err(anyhow!(err_msg));
-        }
-    };
-    
-    // 检查是否成功
-    let success = response_body.get("error").is_none();
-    let error = if !success {
-        let err_msg = response_body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .map(|s| s.to_string());
+
+    /// 获取或创建WebSocket连接
+    async fn get_connection(&mut self, url: &str) -> Result<&mut WebSocketStream<MaybeTlsStream<TcpStream>>, RpcError> {
+        if !self.connections.contains_key(url) {
+            debug!("创建新的WebSocket连接: {}", url);
+            let ws_url = Url::parse(url)
+                .map_err(|e| RpcError::ConfigError(format!("无效的WebSocket URL: {}", e)))?;
             
-        if let Some(ref msg) = err_msg {
-            println!("  [调试] WebSocket请求错误: {}", msg);
+            let (ws_stream, _) = connect_async(ws_url).await
+                .map_err(|e| RpcError::WebSocketError(format!("连接失败: {}", e)))?;
+            
+            self.connections.insert(url.to_string(), ws_stream);
+            info!("WebSocket连接已建立: {}", url);
         }
         
-        err_msg
-    } else {
-        None
-    };
-    
-    // 关闭连接
-    let close_msg = Message::Close(None);
-    if let Err(e) = ws_stream.send(close_msg).await {
-        println!("  [调试] 关闭连接失败: {}", e);
+        Ok(self.connections.get_mut(url).unwrap())
     }
-    
-    Ok((success, latency, error, response_body))
+
+    /// 发送WebSocket RPC请求
+    pub async fn send_request(
+        &mut self,
+        url: &str,
+        method: &str,
+        params: &[Value],
+    ) -> Result<(bool, f64, Option<String>, Value), RpcError> {
+        let start = Instant::now();
+        
+        // 先获取超时配置，避免借用冲突
+        let ws_timeout_secs = self.config.ws_timeout_secs;
+        
+        // 获取连接
+        let ws_stream = self.get_connection(url).await?;
+        
+        // 创建请求
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+        
+        // 发送请求
+        debug!("发送WebSocket请求: {} 到 {}", method, url);
+        let request_message = Message::Text(request_body.to_string());
+        ws_stream.send(request_message).await
+            .map_err(|e| RpcError::WebSocketError(format!("发送消息失败: {}", e)))?;
+        
+        // 等待响应
+        let timeout_duration = Duration::from_secs(ws_timeout_secs);
+        let timeout = tokio::time::sleep(timeout_duration);
+        let response_future = ws_stream.next();
+        
+        pin_mut!(response_future);
+        pin_mut!(timeout);
+        
+        let response = match future::select(response_future, timeout).await {
+            Either::Left((Some(Ok(response)), _)) => {
+                debug!("收到WebSocket响应");
+                response
+            },
+            Either::Left((Some(Err(e)), _)) => {
+                return Err(RpcError::WebSocketError(format!("响应错误: {}", e)));
+            },
+            Either::Left((None, _)) => {
+                return Err(RpcError::WebSocketError("连接已关闭".to_string()));
+            },
+            Either::Right((_, _)) => {
+                return Err(RpcError::TimeoutError(format!("请求超时({}秒)", ws_timeout_secs)));
+            },
+        };
+        
+        let latency = start.elapsed().as_secs_f64() * 1000.0;
+        
+        // 处理响应
+        let response_text = match response {
+            Message::Text(text) => text,
+            _ => return Err(RpcError::WebSocketError("收到非文本响应".to_string())),
+        };
+        
+        let response_body: Value = serde_json::from_str(&response_text)
+            .map_err(|e| RpcError::JsonRpcError(format!("解析响应失败: {}", e)))?;
+        
+        let success = response_body.get("error").is_none();
+        let error = if !success {
+            response_body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        
+        Ok((success, latency, error, response_body))
+    }
+
+    /// 关闭所有连接
+    pub async fn close_all(&mut self) {
+        for (url, mut stream) in self.connections.drain() {
+            debug!("关闭WebSocket连接: {}", url);
+            let _ = stream.send(Message::Close(None)).await;
+        }
+    }
 }
 
-/// 测试单个 RPC 方法
-async fn test_method(
-    client: &Client,
-    chain: &Chain,
-    method: &RpcMethod,
-) -> Result<RpcResult> {
-    // 根据连接类型选择不同的请求处理方式
-    let (success, latency_ms, error, _) = match chain.connection_type {
-        ConnectionType::Http => {
-            // 使用HTTP请求
-            send_http_rpc_request(
-                client,
-                &chain.rpc_url,
-                &method.name,
-                &method.params,
-            )
-            .await?
-        },
-        ConnectionType::WebSocket => {
-            // 使用WebSocket请求
-            send_ws_rpc_request(
-                &chain.rpc_url,
-                &method.name,
-                &method.params,
-            )
-            .await?
-        }
-    };
+/// RPC客户端管理器
+pub struct RpcManager {
+    http_client: Client,
+    ws_manager: WebSocketManager,
+    config: Config,
+}
 
-    Ok(RpcResult {
-        chain: chain.name.clone(),
-        endpoint: chain.rpc_url.clone(),
-        method: method.name.clone(),
-        success,
-        latency_ms,
-        error,
-        timestamp: Utc::now(),
-    })
+impl RpcManager {
+    pub fn new(config: Config) -> Self {
+        let http_client = Client::builder()
+            .timeout(Duration::from_secs(config.http_timeout_secs))
+            .build()
+            .expect("创建HTTP客户端失败");
+        
+        let ws_manager = WebSocketManager::new(Config::default());
+        
+        Self {
+            http_client,
+            ws_manager,
+            config,
+        }
+    }
+
+    /// 发送HTTP RPC请求
+    async fn send_http_request(
+        &self,
+        rpc_url: &str,
+        method: &str,
+        params: &[Value],
+    ) -> Result<(bool, f64, Option<String>, Value), RpcError> {
+        let start = Instant::now();
+        
+        let request_body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        });
+        
+        debug!("发送HTTP请求: {} 到 {}", method, rpc_url);
+        
+        let response = self.http_client
+            .post(rpc_url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| RpcError::NetworkError(format!("HTTP请求失败: {}", e)))?;
+        
+        let latency = start.elapsed().as_secs_f64() * 1000.0;
+        
+        let response_body: Value = response
+            .json()
+            .await
+            .map_err(|e| RpcError::JsonRpcError(format!("解析HTTP响应失败: {}", e)))?;
+        
+        let success = response_body.get("error").is_none();
+        let error = if !success {
+            response_body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+        
+        Ok((success, latency, error, response_body))
+    }
+
+    /// 测试单个RPC方法
+    pub async fn test_method(&mut self, chain: &Chain, method: &RpcMethod) -> RpcResult {
+        let result = match chain.connection_type {
+            ConnectionType::Http => {
+                self.send_http_request(&chain.rpc_url, &method.name, &method.params).await
+            },
+            ConnectionType::WebSocket => {
+                self.ws_manager.send_request(&chain.rpc_url, &method.name, &method.params).await
+            }
+        };
+
+        match result {
+            Ok((success, latency_ms, error, _)) => {
+                RpcResult {
+                    chain: chain.name.clone(),
+                    endpoint: chain.rpc_url.clone(),
+                    method: method.name.clone(),
+                    success,
+                    latency_ms,
+                    error,
+                    timestamp: Utc::now(),
+                }
+            },
+            Err(e) => {
+                error!("RPC调用失败: {}", e);
+                RpcResult {
+                    chain: chain.name.clone(),
+                    endpoint: chain.rpc_url.clone(),
+                    method: method.name.clone(),
+                    success: false,
+                    latency_ms: 0.0,
+                    error: Some(e.to_string()),
+                    timestamp: Utc::now(),
+                }
+            }
+        }
+    }
+
+    /// 关闭所有连接
+    pub async fn close(&mut self) {
+        self.ws_manager.close_all().await;
+    }
 }
 
 /// 测试所有方法
@@ -247,10 +303,11 @@ pub async fn test_all_methods(
     methods: &[RpcMethod],
     count_per_method: usize,
 ) -> Result<Vec<RpcResult>> {
-    let client = Client::new();
+    let config = Config::default();
+    let mut rpc_manager = RpcManager::new(config);
     let mut all_results = Vec::new();
     
-    println!("[调试] 开始测试 {} 个链上的 {} 个方法", chains.len(), methods.len());
+    info!("开始测试 {} 个链上的 {} 个方法", chains.len(), methods.len());
     
     for (chain_idx, chain) in chains.iter().enumerate() {
         println!("测试链[{}/{}]: {} ({}) - 端点: {}", 
@@ -266,35 +323,25 @@ pub async fn test_all_methods(
             let mut last_error = String::new();
             
             for attempt in 0..count_per_method {
-                match test_method(&client, chain, method).await {
-                    Ok(result) => {
-                        method_results.push(result);
-                        if attempt == 0 && chain.connection_type == ConnectionType::WebSocket {
-                            println!("\n  [调试] WebSocket请求成功");
-                        }
-                    },
-                    Err(e) => {
-                        error_occurred = true;
-                        last_error = e.to_string();
-                        let error_msg = format!("测试失败: {}", e);
-                        method_results.push(RpcResult {
-                            chain: chain.name.clone(),
-                            endpoint: chain.rpc_url.clone(),
-                            method: method.name.clone(),
-                            success: false,
-                            latency_ms: 0.0,
-                            error: Some(error_msg),
-                            timestamp: Utc::now(),
-                        });
-                        
-                        // 对于WebSocket连接，如果第一次请求失败，输出详细错误并终止后续尝试
-                        if attempt == 0 && chain.connection_type == ConnectionType::WebSocket {
-                            println!("\n  [调试] WebSocket请求失败: {}", e);
-                            // 对于WebSocket，如果第一个方法失败，可能连接有问题，不再尝试其他次数
-                            break;
-                        }
+                let result = rpc_manager.test_method(chain, method).await;
+                
+                if !result.success {
+                    error_occurred = true;
+                    if let Some(ref error) = result.error {
+                        last_error = error.clone();
                     }
+                    
+                    // 对于WebSocket连接，如果第一次请求失败，输出详细错误并终止后续尝试
+                    if attempt == 0 && chain.connection_type == ConnectionType::WebSocket {
+                        debug!("WebSocket请求失败: {:?}", result.error);
+                        method_results.push(result);
+                        break;
+                    }
+                } else if attempt == 0 && chain.connection_type == ConnectionType::WebSocket {
+                    debug!("WebSocket请求成功");
                 }
+                
+                method_results.push(result);
                 
                 // 添加短暂延迟，避免过度请求
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -319,79 +366,15 @@ pub async fn test_all_methods(
             
             // 如果这是WebSocket链且第一个方法就失败，那么跳过该链的其他测试
             if i == 0 && success_count == 0 && chain.connection_type == ConnectionType::WebSocket {
-                println!("[调试] WebSocket链连接无法建立，跳过其他测试");
+                debug!("WebSocket链连接无法建立，跳过其他测试");
                 break;
             }
         }
     }
     
+    // 关闭所有连接
+    rpc_manager.close().await;
+    
     Ok(all_results)
 }
 
-/// 并发测试所有方法（可选，性能更好但结果可能会受到影响）
-#[allow(dead_code)]
-pub async fn test_all_methods_concurrent(
-    chains: &[Chain],
-    methods: &[RpcMethod],
-    count_per_method: usize,
-) -> Result<Vec<RpcResult>> {
-    let client = Client::new();
-    let mut all_results = Vec::new();
-    
-    for chain in chains {
-        println!("测试链: {}", chain.name);
-        
-        let futures = methods.iter().map(|method| {
-            let chain = chain.clone();
-            let method = method.clone();
-            let client = &client;
-            
-            async move {
-                let mut method_results = Vec::with_capacity(count_per_method);
-                
-                for _ in 0..count_per_method {
-                    match test_method(client, &chain, &method).await {
-                        Ok(result) => method_results.push(result),
-                        Err(e) => {
-                            let error_msg = format!("测试失败: {}", e);
-                            method_results.push(RpcResult {
-                                chain: chain.name.clone(),
-                                endpoint: chain.rpc_url.clone(),
-                                method: method.name.clone(),
-                                success: false,
-                                latency_ms: 0.0,
-                                error: Some(error_msg),
-                                timestamp: Utc::now(),
-                            });
-                        }
-                    }
-                    
-                    // 添加短暂延迟，避免过度请求
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                
-                (method.name.clone(), method_results)
-            }
-        });
-        
-        let results = future::join_all(futures).await;
-        
-        for (method_name, method_results) in results {
-            let success_count = method_results.iter().filter(|r| r.success).count();
-            let avg_latency = if success_count > 0 {
-                method_results.iter().filter(|r| r.success).map(|r| r.latency_ms).sum::<f64>() / success_count as f64
-            } else {
-                0.0
-            };
-            
-            println!(
-                "方法: {} 完成 ({}/{}成功, 平均: {:.2}ms)",
-                method_name, success_count, count_per_method, avg_latency
-            );
-            
-            all_results.extend(method_results);
-        }
-    }
-    
-    Ok(all_results)
-} 

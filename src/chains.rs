@@ -1,3 +1,5 @@
+use log::debug;
+
 /// RPC 连接类型
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionType {
@@ -23,10 +25,10 @@ impl Chain {
     pub fn new(name: &str, rpc_url: &str) -> Self {
         // 根据URL自动确定连接类型
         let connection_type = if rpc_url.starts_with("ws://") || rpc_url.starts_with("wss://") {
-            println!("[调试] 检测到WebSocket URL: {}", rpc_url);
+            debug!("检测到WebSocket URL: {}", rpc_url);
             ConnectionType::WebSocket
         } else {
-            println!("[调试] 检测到HTTP URL: {}", rpc_url);
+            debug!("检测到HTTP URL: {}", rpc_url);
             ConnectionType::Http
         };
 
@@ -36,7 +38,7 @@ impl Chain {
             connection_type,
         };
         
-        println!("[调试] 创建链 {}: {} (连接类型: {:?})", 
+        debug!("创建链 {}: {} (连接类型: {:?})", 
                  name, rpc_url, chain.connection_type);
                  
         chain
